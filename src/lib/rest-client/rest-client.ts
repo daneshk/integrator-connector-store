@@ -305,8 +305,20 @@ function buildSolrQuery(
       return finalQuery || 'org:ballerinax';
     }
 
-    // Add wildcards for partial matching only if query doesn't already have them
-    const searchTerm = hasWildcards ? trimmedQuery : `*${escapedQuery}*`;
+    // Add wildcards for partial matching only if query doesn't already have them.
+    // Multi-word queries are split into separate per-word wildcard clauses rather than
+    // one literal multi-word wildcard term: e.g. `*dynamics 365*` reliably returns 0
+    // results from the API even though `*dynamics*` and `*365*` each match, and ANDing
+    // them individually (`*dynamics* AND *365*`) does too — verified live. filterByRelevance
+    // still requires the full phrase to appear in the name/keywords, so this only widens
+    // the API candidate set; it doesn't loosen what's ultimately shown to the user.
+    const searchTerm = hasWildcards
+      ? trimmedQuery
+      : escapedQuery
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((word) => `*${word}*`)
+          .join(' AND ');
 
     const finalQuery = `${searchTerm} AND ${filters.join(' AND ')}`;
     return finalQuery;
@@ -467,7 +479,9 @@ function filterByExactKeywords(
   params: Pick<SearchParams, 'areas' | 'vendors' | 'types'>
 ): BallerinaPackage[] {
   const hasTag = (pkg: BallerinaPackage, prefix: string, values?: string[]) =>
-    !values || values.length === 0 || values.some((value) => pkg.keywords.includes(`${prefix}${value}`));
+    !values ||
+    values.length === 0 ||
+    values.some((value) => pkg.keywords.includes(`${prefix}${value}`));
 
   return packages.filter(
     (pkg) =>
@@ -478,118 +492,97 @@ function filterByExactKeywords(
 }
 
 /**
- * Search packages with server-side filtering, sorting, and pagination
- * Handles OR logic by making multiple API calls when needed
+ * Fetch every package matching a single filter combination, paginating through
+ * the API in batches. Used whenever the final result set must be exact (see
+ * needsFullFetch in searchPackages) rather than trusting the API's own count/offset.
+ */
+async function fetchAllForCombination(combo: SearchParams): Promise<BallerinaPackage[]> {
+  const countResult = await executeSingleSearch({ ...combo, offset: 0, limit: 1 });
+  const totalCount = countResult.count;
+  const batchSize = 500;
+  const batchPromises = [];
+  for (let offset = 0; offset < totalCount; offset += batchSize) {
+    batchPromises.push(executeSingleSearch({ ...combo, offset, limit: batchSize }));
+  }
+  const batchResults = await Promise.all(batchPromises);
+  return batchResults.flatMap((r) => r.packages);
+}
+
+/**
+ * Search packages with server-side filtering, sorting, and pagination.
+ * Handles OR logic across multi-select filters by making multiple API calls.
  */
 export async function searchPackages(params: SearchParams): Promise<SearchResponse> {
   const combinations = generateFilterCombinations(params);
-
-  // If only one combination, execute directly
-  if (combinations.length === 1) {
-    const needsClientSidePagination =
-      !!params.query || params.sort === 'name-asc' || params.sort === 'name-desc';
-
-    if (needsClientSidePagination) {
-      // Search queries need relevance filtering and name sorts need client-side
-      // display name sorting — fetch all results, then filter/sort/paginate.
-      const countResult = await executeSingleSearch({
-        ...combinations[0],
-        offset: 0,
-        limit: 1,
-      });
-      const totalCount = countResult.count;
-      const batchSize = 500;
-      const batchPromises = [];
-      for (let offset = 0; offset < totalCount; offset += batchSize) {
-        batchPromises.push(executeSingleSearch({ ...combinations[0], offset, limit: batchSize }));
-      }
-      const batchResults = await Promise.all(batchPromises);
-      const allPackages = batchResults.flatMap((r) => r.packages);
-      const visible = excludeHidden(allPackages);
-      const exactMatches = filterByExactKeywords(visible, combinations[0]);
-      const filtered = filterByRelevance(exactMatches, params.query);
-      const sorted = sortMergedPackages(filtered, params.sort, params.query);
-      const paged = sorted.slice(params.offset, params.offset + params.limit);
-      return {
-        packages: paged,
-        count: sorted.length,
-        offset: params.offset,
-        limit: params.limit,
-      };
-    } else {
-      // No search, non-name sort: use server-side pagination for performance.
-      // Hidden packages (~20 out of 800+), plus any false-positive keyword matches
-      // (the API's `keyword:` query isn't an exact match — see filterByExactKeywords),
-      // are filtered client-side after fetching. Overfetch to compensate for any
-      // removed in this page. Total count is adjusted by the actual number excluded,
-      // not the full hidden-list size.
-      const buffer = HIDDEN_PACKAGES.size;
-      const fetchLimit = params.limit + buffer;
-      const result = await executeSingleSearch({
-        ...combinations[0],
-        limit: fetchLimit,
-      });
-      const beforeCount = result.packages.length;
-      result.packages = filterByExactKeywords(excludeHidden(result.packages), combinations[0]);
-      const excludedInPage = beforeCount - result.packages.length;
-      // If we fetched all results, we know the exact excluded count.
-      // Otherwise, estimate proportionally from the page sample.
-      const totalExcluded =
-        beforeCount === 0 || result.count <= fetchLimit
-          ? excludedInPage
-          : Math.round((excludedInPage / beforeCount) * result.count);
-      result.count = Math.max(0, result.count - totalExcluded);
-      result.packages = result.packages.slice(0, params.limit);
-      result.packages = sortMergedPackages(result.packages, params.sort, params.query);
-      result.limit = params.limit;
-      return result;
-    }
-  }
-
-  // Multiple combinations - execute in parallel and merge results
-  // Use offset=0 for each query to get full slices, then paginate merged results once
-  const results = await Promise.all(
-    combinations.map((combo) =>
-      executeSingleSearch({
-        ...combo,
-        offset: 0,
-        limit: params.offset + params.limit, // Fetch enough to cover requested page
-      })
-    )
+  const hasKeywordFilters = !!(
+    params.areas?.length ||
+    params.vendors?.length ||
+    params.types?.length
   );
 
-  // Merge packages and deduplicate by name-version
-  const packageMap = new Map<string, BallerinaPackage>();
-  results.forEach((result) => {
-    result.packages.forEach((pkg) => {
+  // Search queries need relevance filtering, name sorts need client-side display-name
+  // sorting, and any Area/Vendor/Type filter needs exact-match re-checking — the API's
+  // `keyword:` query can both under- and over-match a single tag (see buildSolrQuery and
+  // filterByExactKeywords). All three require the complete result set up front: the API's
+  // own count/offset can't be trusted to reflect what the result looks like after that
+  // client-side filtering, so a fixed overfetch buffer can't be sized correctly either.
+  const needsFullFetch =
+    !!params.query ||
+    params.sort === 'name-asc' ||
+    params.sort === 'name-desc' ||
+    hasKeywordFilters;
+
+  if (needsFullFetch) {
+    const perComboPackages = await Promise.all(combinations.map(fetchAllForCombination));
+
+    // Merge and deduplicate by name-version (combinations can overlap)
+    const packageMap = new Map<string, BallerinaPackage>();
+    perComboPackages.flat().forEach((pkg) => {
       const key = `${pkg.name}-${pkg.version}`;
       if (!packageMap.has(key)) {
         packageMap.set(key, pkg);
       }
     });
+    const merged = Array.from(packageMap.values());
+
+    // filterByExactKeywords uses the original params (not a single combo) so OR
+    // semantics across multi-select values are preserved.
+    const visible = excludeHidden(merged);
+    const exactMatches = filterByExactKeywords(visible, params);
+    const filtered = filterByRelevance(exactMatches, params.query);
+    const sorted = sortMergedPackages(filtered, params.sort, params.query);
+    const paged = sorted.slice(params.offset, params.offset + params.limit);
+    return {
+      packages: paged,
+      count: sorted.length,
+      offset: params.offset,
+      limit: params.limit,
+    };
+  }
+
+  // Fast path: no query, no name-sort, no Area/Vendor/Type filters. The only
+  // client-side exclusion possible here is the small, fixed-size HIDDEN_PACKAGES
+  // set, so a fixed overfetch buffer is safe and server-side pagination can stay fast.
+  const buffer = HIDDEN_PACKAGES.size;
+  const fetchLimit = params.limit + buffer;
+  const result = await executeSingleSearch({
+    ...combinations[0],
+    limit: fetchLimit,
   });
-
-  const mergedPackages = Array.from(packageMap.values());
-
-  // Exclude hidden packages and keyword false-positives, filter to relevant matches, then re-sort.
-  const withoutOther = filterByExactKeywords(excludeHidden(mergedPackages), params);
-  const filteredPackages = filterByRelevance(withoutOther, params.query);
-  const sortedPackages = sortMergedPackages(filteredPackages, params.sort, params.query);
-
-  // Total count is the deduplicated set size
-  const totalCount = sortedPackages.length;
-
-  // Apply pagination once to the sorted results
-  const startIndex = params.offset;
-  const endIndex = startIndex + params.limit;
-  const paginatedPackages = sortedPackages.slice(startIndex, endIndex);
-
-  return {
-    packages: paginatedPackages,
-    count: totalCount,
-    offset: params.offset,
-    limit: params.limit,
-  };
+  const beforeCount = result.packages.length;
+  result.packages = excludeHidden(result.packages);
+  const hiddenInPage = beforeCount - result.packages.length;
+  // If we fetched all results, we know the exact hidden count.
+  // Otherwise, estimate proportionally from the page sample.
+  const totalHidden =
+    beforeCount === 0 || result.count <= fetchLimit
+      ? hiddenInPage
+      : Math.round((hiddenInPage / beforeCount) * result.count);
+  result.count = Math.max(0, result.count - totalHidden);
+  result.packages = result.packages.slice(0, params.limit);
+  result.packages = sortMergedPackages(result.packages, params.sort, params.query);
+  result.limit = params.limit;
+  return result;
 }
 
 const FILTER_CACHE_KEY = 'ballerina_connector_filters';
