@@ -153,7 +153,7 @@ export default function HomePage() {
     'Developer Tools',
     'Storage & File Management',
     'Messaging',
-    'HRMS',
+    'Human Resources',
     'Healthcare',
   ];
   const [filterOptions, setFilterOptionsState] = useState<FilterOptions>({

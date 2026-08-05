@@ -216,7 +216,7 @@ function sortMergedPackages(
  * @example buildSolrQuery({query: 'graphql', areas: ['Finance']})
  *   → "graphql AND org:ballerinax AND keyword:Area/Finance"
  * @example buildSolrQuery({areas: ['Finance'], vendors: ['Amazon']})
- *   → "org:ballerinax AND keyword:Area/Finance AND keyword:Vendor/Amazon"
+ *   → "org:ballerinax AND keyword:Vendor/Amazon AND keyword:Area/Finance"
  */
 function buildSolrQuery(
   params: Pick<SearchParams, 'areas' | 'vendors' | 'types' | 'query' | 'orgName'>
@@ -236,6 +236,11 @@ function buildSolrQuery(
    * Escape Solr query special characters
    * Escapes: + - && || ! ( ) { } [ ] ^ " ~ * ? : \ /
    * Also handles leading/trailing whitespace
+   *
+   * Space is deliberately NOT escaped: the API's wildcard search treats the whole
+   * `*...*` term as a literal pattern (not analyzed/tokenized), so an escaped space
+   * (`\ `) never matches anything. Leaving the space bare lets multi-word queries
+   * like "SAP Business" match a literal "sap business" substring in indexed fields.
    */
   function escapeSolrQuery(query: string): string {
     // Trim whitespace first
@@ -244,15 +249,7 @@ function buildSolrQuery(
 
     // Escape special Solr characters
     // Note: We escape * and ? here but will add them back if needed for wildcards
-    return trimmed.replace(/([+\-&|!(){}[\]^"~*?:\\/ ])/g, '\\$1');
-  }
-
-  // Add area filter (required with AND operator)
-  if (params.areas && params.areas.length > 0) {
-    params.areas.forEach((area) => {
-      const escaped = escapeLuceneValue(area);
-      filters.push(`keyword:Area/${escaped}`);
-    });
+    return trimmed.replace(/([+\-&|!(){}[\]^"~*?:\\/])/g, '\\$1');
   }
 
   // Add vendor filter (required with AND operator)
@@ -268,6 +265,20 @@ function buildSolrQuery(
     params.types.forEach((type) => {
       const escaped = escapeLuceneValue(type);
       filters.push(`keyword:Type/${escaped}`);
+    });
+  }
+
+  // Add area filter last (required with AND operator).
+  // Several area names contain "&" (e.g. "Finance & Accounting"), and the search
+  // API's query parser silently returns 0 results if an unescaped "&...&"-bearing
+  // clause is followed by another "AND keyword:..." clause — verified against the
+  // live API that the same clauses in the opposite order parse correctly. Keeping
+  // area filters last sidesteps that parser quirk instead of relying on escaping,
+  // which does not fix it (see https://github.com/wso2/product-integrator/issues/1853).
+  if (params.areas && params.areas.length > 0) {
+    params.areas.forEach((area) => {
+      const escaped = escapeLuceneValue(area);
+      filters.push(`keyword:Area/${escaped}`);
     });
   }
 
@@ -441,6 +452,32 @@ function excludeHidden(packages: BallerinaPackage[]): BallerinaPackage[] {
 }
 
 /**
+ * Re-check Area/Vendor/Type filters against each package's own keyword array.
+ *
+ * The search API's `keyword:` field query is not an exact match on a single tag —
+ * it matches loosely/tokenized against the whole keyword list. E.g. `keyword:Vendor/OpenAI`
+ * also matches `azure.openai.text` (actual vendor: Microsoft) purely because it carries
+ * an unrelated bare keyword `"Azure OpenAI"`, and an Area value containing "&" (e.g.
+ * "Finance & Accounting") can match packages tagged with a completely different area
+ * that merely share a bare keyword like "Finance". This filters out those false
+ * positives so only packages with the exact `Area/`, `Vendor/`, or `Type/` tag survive.
+ */
+function filterByExactKeywords(
+  packages: BallerinaPackage[],
+  params: Pick<SearchParams, 'areas' | 'vendors' | 'types'>
+): BallerinaPackage[] {
+  const hasTag = (pkg: BallerinaPackage, prefix: string, values?: string[]) =>
+    !values || values.length === 0 || values.some((value) => pkg.keywords.includes(`${prefix}${value}`));
+
+  return packages.filter(
+    (pkg) =>
+      hasTag(pkg, 'Area/', params.areas) &&
+      hasTag(pkg, 'Vendor/', params.vendors) &&
+      hasTag(pkg, 'Type/', params.types)
+  );
+}
+
+/**
  * Search packages with server-side filtering, sorting, and pagination
  * Handles OR logic by making multiple API calls when needed
  */
@@ -469,7 +506,8 @@ export async function searchPackages(params: SearchParams): Promise<SearchRespon
       const batchResults = await Promise.all(batchPromises);
       const allPackages = batchResults.flatMap((r) => r.packages);
       const visible = excludeHidden(allPackages);
-      const filtered = filterByRelevance(visible, params.query);
+      const exactMatches = filterByExactKeywords(visible, combinations[0]);
+      const filtered = filterByRelevance(exactMatches, params.query);
       const sorted = sortMergedPackages(filtered, params.sort, params.query);
       const paged = sorted.slice(params.offset, params.offset + params.limit);
       return {
@@ -480,9 +518,11 @@ export async function searchPackages(params: SearchParams): Promise<SearchRespon
       };
     } else {
       // No search, non-name sort: use server-side pagination for performance.
-      // Hidden packages (~20 out of 800+) are filtered client-side after fetching.
-      // Overfetch by the hidden list size to compensate for any removed in this page.
-      // Total count is adjusted by actual hidden packages found, not the full set size.
+      // Hidden packages (~20 out of 800+), plus any false-positive keyword matches
+      // (the API's `keyword:` query isn't an exact match — see filterByExactKeywords),
+      // are filtered client-side after fetching. Overfetch to compensate for any
+      // removed in this page. Total count is adjusted by the actual number excluded,
+      // not the full hidden-list size.
       const buffer = HIDDEN_PACKAGES.size;
       const fetchLimit = params.limit + buffer;
       const result = await executeSingleSearch({
@@ -490,15 +530,15 @@ export async function searchPackages(params: SearchParams): Promise<SearchRespon
         limit: fetchLimit,
       });
       const beforeCount = result.packages.length;
-      result.packages = excludeHidden(result.packages);
-      const hiddenInPage = beforeCount - result.packages.length;
-      // If we fetched all results, we know the exact hidden count.
+      result.packages = filterByExactKeywords(excludeHidden(result.packages), combinations[0]);
+      const excludedInPage = beforeCount - result.packages.length;
+      // If we fetched all results, we know the exact excluded count.
       // Otherwise, estimate proportionally from the page sample.
-      const totalHidden =
+      const totalExcluded =
         beforeCount === 0 || result.count <= fetchLimit
-          ? hiddenInPage
-          : Math.round((hiddenInPage / beforeCount) * result.count);
-      result.count = Math.max(0, result.count - totalHidden);
+          ? excludedInPage
+          : Math.round((excludedInPage / beforeCount) * result.count);
+      result.count = Math.max(0, result.count - totalExcluded);
       result.packages = result.packages.slice(0, params.limit);
       result.packages = sortMergedPackages(result.packages, params.sort, params.query);
       result.limit = params.limit;
@@ -531,8 +571,8 @@ export async function searchPackages(params: SearchParams): Promise<SearchRespon
 
   const mergedPackages = Array.from(packageMap.values());
 
-  // Exclude hidden packages, filter to relevant matches, then re-sort.
-  const withoutOther = excludeHidden(mergedPackages);
+  // Exclude hidden packages and keyword false-positives, filter to relevant matches, then re-sort.
+  const withoutOther = filterByExactKeywords(excludeHidden(mergedPackages), params);
   const filteredPackages = filterByRelevance(withoutOther, params.query);
   const sortedPackages = sortMergedPackages(filteredPackages, params.sort, params.query);
 
