@@ -153,6 +153,7 @@ const CAPITALIZATION_DICTIONARY: Record<string, string> = {
  */
 export const HIDDEN_PACKAGES = new Set<string>([
   'asyncapi.native.handler',
+  'aws',
   'choreo',
   'client.config',
   'health.base',
